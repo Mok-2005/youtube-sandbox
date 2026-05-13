@@ -1,0 +1,121 @@
+name: YouTube Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of the video'
+        required: true
+        type: string
+      output_folder:
+        description: 'Folder where the video will be saved'
+        required: false
+        type: string
+        default: 'downloads'
+      quality:
+        description: 'Video quality (yt-dlp format selector)'
+        required: false
+        type: string
+        default: 'bestvideo[height<=360]+bestaudio/best[ext=mp4]/best'
+      archive_name:
+        description: 'Base name for the RAR archive (if file is split)'
+        required: false
+        type: string
+        default: 'video'
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-split:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install yt-dlp and rar
+        run: |
+          pip install -U yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y rar
+
+      - name: Download video (with retries)
+        id: download
+        shell: bash
+        run: |
+          FOLDER="${{ github.event.inputs.output_folder }}"
+          mkdir -p "$FOLDER"
+          cd "$FOLDER"
+
+          MAX_RETRIES=5
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            echo "Download attempt $i/$MAX_RETRIES"
+            # Use --print to get the final file path after download
+            OUTPUT_PATH=$(yt-dlp \
+              --output "%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+              --format "${{ github.event.inputs.quality }}" \
+              --merge-output-format mp4 \
+              --retries 3 \
+              --fragment-retries 10 \
+              --no-check-certificate \
+              --geo-bypass \
+              --no-color \
+              --print after_move:filepath \
+              "${{ github.event.inputs.url }}")
+
+            if [ -n "$OUTPUT_PATH" ] && [ -f "$OUTPUT_PATH" ]; then
+              echo "Download succeeded: $OUTPUT_PATH"
+              FILENAME=$(basename "$OUTPUT_PATH")
+              SIZE_BYTES=$(stat -c %s "$OUTPUT_PATH")
+              echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+              echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
+              echo "filepath=$OUTPUT_PATH" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "Download attempt $i failed or file not found."
+              sleep 5
+            fi
+          done
+
+          echo "All download attempts failed."
+          exit 1
+
+      - name: Split large file (if > 99 MB)
+        id: split
+        shell: bash
+        run: |
+          SIZE_BYTES=${{ steps.download.outputs.size_bytes }}
+          THRESHOLD_BYTES=$((99 * 1024 * 1024))  # 99 MB
+
+          if [ "$SIZE_BYTES" -gt "$THRESHOLD_BYTES" ]; then
+            FOLDER="${{ github.event.inputs.output_folder }}"
+            FILEPATH="${{ steps.download.outputs.filepath }}"
+            cd "$FOLDER"
+            RANDOM_HEX=$(openssl rand -hex 3)
+            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
+            # Split into 95 MB parts
+            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$(basename "$FILEPATH")"
+            rm -f "$FILEPATH"
+            echo "split_done=true" >> $GITHUB_OUTPUT
+            echo "Archive created: ${ARCHIVE_NAME}.part1.rar ..."
+          else
+            echo "split_done=false" >> $GITHUB_OUTPUT
+            echo "File size ($SIZE_BYTES bytes) below 99 MB, no splitting."
+          fi
+
+      - name: Commit and push to repository
+        shell: bash
+        run: |
+          FOLDER="${{ github.event.inputs.output_folder }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Pull latest changes to avoid conflict
+          git pull --rebase origin "${{ github.ref_name }}" || echo "No remote changes"
+          git add "$FOLDER/"
+          git commit -m "Add downloaded video from ${{ github.event.inputs.url }}" || echo "Nothing to commit"
+          git push
